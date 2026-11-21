@@ -121,6 +121,17 @@ def get_json(port: int, path: str):
         return r.status, json.loads(r.read().decode())
 
 
+def post_json(port: int, path: str, payload: dict):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status, json.loads(r.read().decode())
+
+
 def get_bytes(port: int, path: str):
     with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=10) as r:
         return r.status, r.read()
@@ -211,23 +222,78 @@ def main() -> int:
             f"追加证明条目数 O(log n)={len(append['entries'])} ≤ 14",
         )
 
+        # 4.5) 目录对账：科研组视角，本地缺 1 单，凭留存检查点跨实例核对，
+        #      离线核实缺单清单；两实例对同一检查点给出完全一致的对账结果。
+        from app.reconcile import run_reconciliation
+        from app.verify import verify_reconciliation
+
+        _, all_releases = get_json(PORT_A, "/releases")
+        _, retained_cp = get_json(PORT_A, "/checkpoints/latest")
+        local = [
+            {
+                k: r[k]
+                for k in ("station_id", "sample_date", "order_no", "blob_sha256", "size")
+            }
+            for r in all_releases
+        ]
+        missing_idx = 3
+        local[missing_idx] = None  # 模拟本地缺单
+
+        def make_query(port):
+            def query(seq, ranges):
+                status, payload = post_json(
+                    port, "/reconcile", {"checkpoint_seq": seq, "ranges": ranges}
+                )
+                assert status == 200, payload
+                return payload
+
+            return query
+
+        transcript_b = run_reconciliation(local, retained_cp, make_query(PORT_B), 7)
+        ok, msg, missing, mismatched = verify_reconciliation(
+            local, transcript_b, retained_cp
+        )
+        check(
+            ok
+            and len(missing) == 1
+            and missing[0]["index"] == missing_idx
+            and not mismatched,
+            f"跨实例目录对账：离线核实缺单清单正确（{msg}）",
+        )
+        transcript_a = run_reconciliation(local, retained_cp, make_query(PORT_A), 7)
+        check(
+            transcript_a["results"] == transcript_b["results"],
+            "两实例对同一检查点的对账结果完全一致",
+        )
+        # 对账期间的新发布不改变这一轮的结果。
+        status_late, late = post_release(
+            PORT_B, "ST-LATE", "2026-11-16", "ORD-LATE", b"late\n"
+        )
+        check(status_late == 201 and late["release"]["id"] == 12, "对账期间可继续发布")
+        transcript_after = run_reconciliation(local, retained_cp, make_query(PORT_B), 7)
+        check(
+            transcript_after["results"] == transcript_b["results"],
+            "对账期间的新发布不改变本轮对账结果",
+        )
+
         # 5) 故障转移：原实例不杀（本环境 seccomp 禁止 kill），
         #    另起一个全新进程指向同一共享卷，模拟实例重启/替换。
         proc_c = start_instance(PORT_C, data_dir)
         try:
             _, health = get_json(PORT_C, "/health")
             check(
-                health["status"] == "ok" and health["release_count"] == 11,
-                "新实例挂载同卷后自检通过且条数仍为 11",
+                health["status"] == "ok" and health["release_count"] == 12,
+                "新实例挂载同卷后自检通过且条数仍为 12",
             )
             _, cp_after = get_json(PORT_C, "/checkpoints/latest")
-            check(cp_after == cp_a, "重启视角下最新检查点根摘要不变")
+            _, cp_latest_a = get_json(PORT_A, "/checkpoints/latest")
+            check(cp_after == cp_latest_a, "重启视角下最新检查点根摘要不变")
             status_post, new_pub = post_release(
                 PORT_C, "ST99", "2026-11-16", "ORD-AFTER-RESTART", b"after\n"
             )
             check(
-                status_post == 201 and new_pub["release"]["id"] == 12,
-                "新实例可继续追加，新记录序号=12",
+                status_post == 201 and new_pub["release"]["id"] == 13,
+                "新实例可继续追加，新记录序号=13",
             )
             _, proof12 = get_json(
                 PORT_B,

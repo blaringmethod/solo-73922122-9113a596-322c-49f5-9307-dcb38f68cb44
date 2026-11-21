@@ -258,6 +258,87 @@ class Database:
             return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------ #
+    # 目录对账（只读；只交换摘要与目录字段）
+    # ------------------------------------------------------------------ #
+    def reconcile(self, checkpoint_seq: int, ranges: list[dict]):
+        """按历史检查点核对发布前缀，返回 (检查点, 区间结果列表)。
+
+        快照一致性：在单个只读事务内读取历史检查点与前 ``checkpoint_seq``
+        条目录并计算各请求区间的子树摘要。发布只增不改，对账期间的新发布
+        （id > checkpoint_seq）既不进入该前缀也不进入本读快照，因此不改变
+        本轮对账结果。
+
+        对每个请求区间 ``{start, height, local_root}``：
+          * 本地摘要与服务器一致      -> ``match``（调用方无需继续下钻）；
+          * 不一致且 height > 0       -> ``diverged``，附服务器侧区间摘要；
+          * 不一致且 height == 0      -> ``leaf``，附检查点承诺的目录字段
+            （该位置超出检查点条数时为 None，表示检查点内为空叶）。
+
+        检查点不存在时返回 None。
+        """
+        depth = self._settings.tree_depth
+        with self.connect() as conn:
+            conn.execute("BEGIN")  # 只读快照事务（WAL 下不阻塞写者）
+            try:
+                cp_row = conn.execute(
+                    "SELECT * FROM checkpoints WHERE seq = ?", (checkpoint_seq,)
+                ).fetchone()
+                if cp_row is None:
+                    conn.rollback()
+                    return None
+                rows = conn.execute(
+                    "SELECT station_id, sample_date, order_no, blob_sha256, size "
+                    "FROM releases WHERE id <= ? ORDER BY id ASC",
+                    (checkpoint_seq,),
+                ).fetchall()
+                leaves = [
+                    merkle.leaf_hash(
+                        r["station_id"],
+                        r["sample_date"],
+                        r["order_no"],
+                        r["blob_sha256"],
+                        r["size"],
+                    )
+                    for r in rows
+                ]
+                results: list[dict] = []
+                for item in ranges:
+                    start = item["start"]
+                    height = item["height"]
+                    server_root = merkle.subtree_root(leaves, start, height, depth)
+                    entry: dict = {
+                        "start": start,
+                        "height": height,
+                        "server_root": None,
+                        "leaf_record": None,
+                    }
+                    if server_root.hex() == item["local_root"]:
+                        entry["status"] = "match"
+                    elif height > 0:
+                        entry["status"] = "diverged"
+                        entry["server_root"] = server_root.hex()
+                    else:
+                        entry["status"] = "leaf"
+                        entry["server_root"] = server_root.hex()
+                        if start < len(rows):
+                            row = rows[start]
+                            entry["leaf_record"] = {
+                                "v": merkle.LEAF_VERSION,
+                                "station_id": row["station_id"],
+                                "sample_date": row["sample_date"],
+                                "order_no": row["order_no"],
+                                "blob_sha256": row["blob_sha256"],
+                                "size": row["size"],
+                            }
+                        # start >= 检查点条数：该位置为空叶，leaf_record 保持 None
+                    results.append(entry)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return dict(cp_row), results
+
+    # ------------------------------------------------------------------ #
     # 启动自检：不得带着缺件记录对外服务
     # ------------------------------------------------------------------ #
     def integrity_problems(self, blob_verifier) -> list[str]:

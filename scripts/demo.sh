@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 端到端演示：发布 -> 幂等重试 -> 冲突拒绝 -> 取件 -> 两类证明 -> 离线核验 -> 篡改拒绝。
+# 端到端演示：发布 -> 幂等重试 -> 冲突拒绝 -> 取件 -> 两类证明 -> 离线核验 -> 篡改拒绝
+#             -> 目录对账（本地缺单/错单排查）-> 离线核实缺单与错单清单。
 # 用法：BASE=http://127.0.0.1:8001 bash scripts/demo.sh
 set -euo pipefail
 
@@ -60,3 +61,65 @@ cp "$WORK/day1.csv" "$WORK/tampered.csv"
 printf 'X' >> "$WORK/tampered.csv"
 python3 -m app.verify inclusion \
   --proof "$WORK/inclusion.json" --file "$WORK/tampered.csv" || true
+
+echo "== 9. 目录对账：凭留存检查点核对本地目录（只交换摘要与目录字段）=="
+# 模拟科研组本地目录：第 1 件缺单（null），第 2 件摘要被记错。
+python3 - "$BASE" "$WORK" <<'PY'
+import json
+import sys
+import urllib.request
+
+sys.path.insert(0, ".")
+from app.reconcile import run_reconciliation
+
+base, work = sys.argv[1], sys.argv[2]
+
+
+def get(path):
+    with urllib.request.urlopen(base + path) as resp:
+        return json.loads(resp.read().decode())
+
+
+def post(path, payload):
+    req = urllib.request.Request(
+        base + path,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode())
+
+
+depth = get("/")["limits"]["tree_depth"]
+checkpoint = get("/checkpoints/latest")  # 科研组留存检查点
+releases = get("/releases")
+local = [
+    {k: r[k] for k in ("station_id", "sample_date", "order_no", "blob_sha256", "size")}
+    for r in releases
+]
+local[0] = None  # 本地缺单
+local[1] = {**local[1], "blob_sha256": "00" * 32}  # 本地错单
+
+transcript = run_reconciliation(
+    local,
+    checkpoint,
+    lambda seq, ranges: post(
+        "/reconcile", {"checkpoint_seq": seq, "ranges": ranges}
+    ),
+    depth,
+)
+with open(f"{work}/local.json", "w") as fh:
+    json.dump(local, fh, ensure_ascii=False)
+with open(f"{work}/recon.json", "w") as fh:
+    json.dump(transcript, fh, ensure_ascii=False)
+with open(f"{work}/cp.json", "w") as fh:
+    json.dump(checkpoint, fh, ensure_ascii=False)
+print(f"对账完成：共交换 {len(transcript['results'])} 个区间结果（仅摘要与目录字段）")
+PY
+
+echo "== 10. 离线核实缺单与错单完整清单 =="
+python3 -m app.verify reconcile \
+  --local "$WORK/local.json" \
+  --reconciliation "$WORK/recon.json" \
+  --checkpoint "$WORK/cp.json"

@@ -77,6 +77,43 @@ def empty_root(depth: int) -> bytes:
     return root_from_leaves([], depth)
 
 
+def empty_subtree_root(height: int) -> bytes:
+    """全空完美子树的根：``2**height`` 个槽位全部以 EMPTY_LEAF 填充。
+
+    用于目录对账：本地缺单按空叶处理，全空区间可直接给出摘要而无需逐叶计算。
+    """
+    if height < 0:
+        raise ValueError("子树高度不能为负")
+    node = EMPTY_LEAF
+    for _ in range(height):
+        node = pair_hash(node, node)
+    return node
+
+
+def subtree_root(
+    leaf_hashes: Sequence[bytes], start: int, height: int, depth: int
+) -> bytes:
+    """计算以 ``start`` 为起点、覆盖 ``2**height`` 个槽位的完美子树根。
+
+    ``leaf_hashes`` 为前 N 个叶子的哈希，其余槽位以 EMPTY_LEAF 占位；
+    完全落在已有叶子之后的区间直接返回全空子树根。
+    """
+    size = 1 << height
+    if not (0 <= height <= depth) or start < 0 or start % size != 0:
+        raise ValueError("子树高度非法或起点未对齐")
+    if start + size > (1 << depth):
+        raise ValueError("子树超出树容量")
+    if start >= len(leaf_hashes):
+        return empty_subtree_root(height)
+    level = [
+        leaf_hashes[i] if i < len(leaf_hashes) else EMPTY_LEAF
+        for i in range(start, start + size)
+    ]
+    for _ in range(height):
+        level = [pair_hash(level[i], level[i + 1]) for i in range(0, len(level), 2)]
+    return level[0]
+
+
 # --------------------------------------------------------------------------- #
 # 纳入证明（inclusion proof）
 # --------------------------------------------------------------------------- #
@@ -182,17 +219,8 @@ def _tile(lo: int, hi: int, depth: int) -> list[tuple[int, int]]:
 def _subtree_root(
     leaf_hashes: Sequence[bytes], start: int, height: int, depth: int
 ) -> bytes:
-    """计算以 ``start`` 为起点、覆盖 2**height 个槽位的完美子树根。"""
-    size = 1 << height
-    if start % size != 0 or start + size > (1 << depth):
-        raise ValueError("子树起点未对齐或超出树容量")
-    level = [
-        leaf_hashes[i] if i < len(leaf_hashes) else EMPTY_LEAF
-        for i in range(start, start + size)
-    ]
-    for _ in range(height):
-        level = [pair_hash(level[i], level[i + 1]) for i in range(0, len(level), 2)]
-    return level[0]
+    """兼容内部调用的旧名，等价于 :func:`subtree_root`。"""
+    return subtree_root(leaf_hashes, start, height, depth)
 
 
 def append_proof(

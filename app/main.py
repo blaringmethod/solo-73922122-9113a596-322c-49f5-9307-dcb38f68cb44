@@ -30,6 +30,9 @@ from .schemas import (
     InclusionProofOut,
     LeafRecordOut,
     PublishResult,
+    ReconcileRequest,
+    ReconcileResponse,
+    ReconcileResultOut,
     ReleaseOut,
 )
 from .storage import BlobError, BlobStore
@@ -285,6 +288,60 @@ async def append_proof(old_seq: int):
         new_root=new_cp["root_hex"],
         tree_depth=settings.tree_depth,
         entries=entries,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 目录对账
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/reconcile",
+    response_model=ReconcileResponse,
+    summary="目录对账：按历史检查点核对发布前缀，从根摘要下钻差异区间",
+    description=(
+        "科研组凭留存检查点核对本地发布目录：对请求的每个 Merkle 区间，"
+        "本地摘要一致返回 match；不一致的内部区间返回 diverged 与服务器侧摘要，"
+        "应按两个子区间继续核对；不一致的单条返回 leaf 与检查点承诺的目录字段。"
+        "本地缺单按空叶处理。只读历史前缀（id ≤ checkpoint_seq），"
+        "对账期间的新发布不改变本轮结果；全程只交换摘要与目录字段。"
+    ),
+)
+async def reconcile(request: ReconcileRequest):
+    # 对账只读数据库中的目录与摘要，不触碰原件字节；即使卷上缺件
+    # （degraded），对账仍是排查缺单的手段，故不要求启动自检通过。
+    depth = settings.tree_depth
+    capacity = settings.tree_capacity
+    ranges: list[dict] = []
+    for item in request.ranges:
+        if item.height > depth:
+            raise HTTPException(
+                422, f"区间高度超过树深度 {depth}: height={item.height}"
+            )
+        size = 1 << item.height
+        if item.start % size != 0 or item.start + size > capacity:
+            raise HTTPException(
+                422,
+                f"区间未按 2**height 对齐或超出树容量: "
+                f"start={item.start} height={item.height}",
+            )
+        ranges.append(
+            {
+                "start": item.start,
+                "height": item.height,
+                "local_root": item.local_root.lower(),
+            }
+        )
+    outcome = await run_in_threadpool(
+        database.reconcile, request.checkpoint_seq, ranges
+    )
+    if outcome is None:
+        raise HTTPException(404, f"不存在序号为 {request.checkpoint_seq} 的检查点")
+    checkpoint, results = outcome
+    return ReconcileResponse(
+        checkpoint_seq=checkpoint["seq"],
+        checkpoint_root=checkpoint["root_hex"],
+        tree_depth=depth,
+        results=[ReconcileResultOut(**r) for r in results],
     )
 
 
